@@ -15024,11 +15024,16 @@ Please investigate this Shortcut story and implement the requested work. Verify 
       pending: "Reading assigned Shortcut stories",
       completed: "Read assigned Shortcut stories"
     },
-    parameters: external_exports.object({
-      query: external_exports.string().optional(),
-      includeCompleted: external_exports.boolean().optional()
-    }).strict(),
-    async execute({ query = "", includeCompleted }, { signal }) {
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        query: { type: "string" },
+        includeCompleted: { type: "boolean" }
+      }
+    },
+    async execute(params, { signal }) {
+      const { query = "", includeCompleted } = params;
       const values = await settings.get();
       const result = await assigned(includeCompleted ?? values.includeCompleted, false, signal);
       return JSON.stringify(filterStories(result.stories, query), null, 2);
@@ -15041,8 +15046,16 @@ Please investigate this Shortcut story and implement the requested work. Verify 
       pending: "Reading Shortcut story",
       completed: "Read Shortcut story"
     },
-    parameters: external_exports.object({ id: external_exports.number().int().positive() }).strict(),
-    async execute({ id }, { signal }) {
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        id: { type: "integer", minimum: 1 }
+      },
+      required: ["id"]
+    },
+    async execute(params, { signal }) {
+      const { id } = params;
       return storyAsMarkdown(await story(id, signal));
     }
   });
