@@ -309,11 +309,16 @@ export default async function plugin(bb: BbPluginApi) {
       pending: "Reading assigned Shortcut stories",
       completed: "Read assigned Shortcut stories",
     },
-    parameters: z.object({
-      query: z.string().optional(),
-      includeCompleted: z.boolean().optional(),
-    }).strict(),
-    async execute({ query = "", includeCompleted }, { signal }) {
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        query: { type: "string" },
+        includeCompleted: { type: "boolean" },
+      },
+    },
+    async execute(params, { signal }) {
+      const { query = "", includeCompleted } = params as { query?: string; includeCompleted?: boolean };
       const values = await settings.get();
       const result = await assigned(includeCompleted ?? values.includeCompleted, false, signal);
       return JSON.stringify(filterStories(result.stories, query), null, 2);
@@ -327,8 +332,16 @@ export default async function plugin(bb: BbPluginApi) {
       pending: "Reading Shortcut story",
       completed: "Read Shortcut story",
     },
-    parameters: z.object({ id: z.number().int().positive() }).strict(),
-    async execute({ id }, { signal }) {
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        id: { type: "integer", minimum: 1 },
+      },
+      required: ["id"],
+    },
+    async execute(params, { signal }) {
+      const { id } = params as { id: number };
       return storyAsMarkdown(await story(id, signal));
     },
   });
