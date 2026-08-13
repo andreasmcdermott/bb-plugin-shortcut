@@ -237,6 +237,37 @@ export class ShortcutClient {
     };
   }
 
+  private async storyWithWorkflowStates(
+    id: number,
+    signal?: AbortSignal,
+  ): Promise<{
+    states: Map<number, ShortcutWorkflowState>;
+    story: ShortcutStory;
+  }> {
+    const [states, rawStory] = await Promise.all([
+      this.workflowStates(signal),
+      this.request<ApiStory>(`/stories/${id}`, {}, signal),
+    ]);
+    return { states, story: this.normalizeStory(rawStory, states) };
+  }
+
+  private async putStoryWorkflowState(
+    id: number,
+    targetState: ShortcutWorkflowState,
+    states: Map<number, ShortcutWorkflowState>,
+    signal?: AbortSignal,
+  ): Promise<ShortcutStory> {
+    const updated = await this.request<ApiStory>(
+      `/stories/${id}`,
+      {
+        method: "PUT",
+        body: JSON.stringify({ workflow_state_id: targetState.id }),
+      },
+      signal,
+    );
+    return this.normalizeStory(updated, states);
+  }
+
   async listAssignedStories(
     includeCompleted = false,
     signal?: AbortSignal,
@@ -271,11 +302,37 @@ export class ShortcutClient {
   }
 
   async getStory(id: number, signal?: AbortSignal): Promise<ShortcutStory> {
-    const [states, story] = await Promise.all([
-      this.workflowStates(signal),
-      this.request<ApiStory>(`/stories/${id}`, {}, signal),
-    ]);
-    return this.normalizeStory(story, states);
+    return (await this.getStoryDetail(id, signal)).story;
+  }
+
+  async getStoryDetail(
+    id: number,
+    signal?: AbortSignal,
+  ): Promise<{ story: ShortcutStory; workflowStates: ShortcutWorkflowState[] }> {
+    const { states, story } = await this.storyWithWorkflowStates(id, signal);
+    return {
+      story,
+      workflowStates: [...states.values()]
+        .filter((state) => state.workflowId === story.workflowState.workflowId)
+        .sort((a, b) => a.position - b.position || a.name.localeCompare(b.name)),
+    };
+  }
+
+  async updateStoryWorkflowState(
+    id: number,
+    workflowStateId: number,
+    signal?: AbortSignal,
+  ): Promise<ShortcutStory> {
+    const { states, story } = await this.storyWithWorkflowStates(id, signal);
+    const targetState = states.get(workflowStateId);
+    if (!targetState || targetState.workflowId !== story.workflowState.workflowId) {
+      throw new ShortcutApiError(
+        `Workflow state ${workflowStateId} does not belong to the story's workflow.`,
+      );
+    }
+    if (targetState.id === story.workflowState.id) return story;
+
+    return this.putStoryWorkflowState(id, targetState, states, signal);
   }
 
   async reorderStory(
@@ -307,11 +364,7 @@ export class ShortcutClient {
     id: number,
     signal?: AbortSignal,
   ): Promise<ShortcutStory> {
-    const [states, rawStory] = await Promise.all([
-      this.workflowStates(signal),
-      this.request<ApiStory>(`/stories/${id}`, {}, signal),
-    ]);
-    const story = this.normalizeStory(rawStory, states);
+    const { states, story } = await this.storyWithWorkflowStates(id, signal);
     const normalizedTargetName = IN_DEVELOPMENT_STATE_NAME.toLowerCase();
 
     if (story.workflowState.name.trim().toLowerCase() === normalizedTargetName) {
@@ -328,15 +381,7 @@ export class ShortcutClient {
       );
     }
 
-    const updated = await this.request<ApiStory>(
-      `/stories/${id}`,
-      {
-        method: "PUT",
-        body: JSON.stringify({ workflow_state_id: targetState.id }),
-      },
-      signal,
-    );
-    return this.normalizeStory(updated, states);
+    return this.putStoryWorkflowState(id, targetState, states, signal);
   }
 }
 

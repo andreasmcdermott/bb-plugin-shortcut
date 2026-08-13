@@ -16,7 +16,11 @@ import {
 } from "@bb/plugin-sdk/app";
 import { toast } from "sonner";
 import type { rpcContract } from "./server";
-import type { ShortcutMember, ShortcutStory as Story } from "./shortcut-client";
+import type {
+  ShortcutMember,
+  ShortcutStory as Story,
+  ShortcutWorkflowState,
+} from "./shortcut-client";
 import { Button } from "@/components/ui/button";
 import {
   ContextMenu,
@@ -41,6 +45,10 @@ import {
   workflowsForStories,
 } from "./kanban";
 import { shortcutStoryIdFromUrl, shortcutStoryPluginPath } from "./shortcut-links";
+import {
+  requestWorkflowStateUpdate,
+  StoryDetailRequestGuard,
+} from "./story-detail-requests";
 
 type AssignedResult = { member: ShortcutMember; stories: Story[] };
 
@@ -118,11 +126,46 @@ function KanbanSkeleton() {
   );
 }
 
-function StateBadge({ story }: { story: Story }) {
+function WorkflowStatePicker({
+  story,
+  states,
+  updating,
+  onChange,
+}: {
+  story: Story;
+  states: ShortcutWorkflowState[];
+  updating: boolean;
+  onChange: (state: ShortcutWorkflowState) => void;
+}) {
   return (
-    <span className="inline-flex items-center rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground">
-      {story.workflowState.name}
-    </span>
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <button
+          type="button"
+          disabled={updating}
+          aria-label={`Change workflow state. Current state: ${story.workflowState.name}`}
+          title="Change workflow state"
+          className="inline-flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-wait disabled:opacity-60"
+        >
+          <span>{updating ? "Updating…" : story.workflowState.name}</span>
+          <span aria-hidden="true" className="text-[9px]">▾</span>
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start" mobileTitle="Change workflow state">
+        {states.map((state) => (
+          <DropdownMenuItem
+            key={state.id}
+            disabled={updating || state.id === story.workflowState.id}
+            onSelect={() => onChange(state)}
+          >
+            <span className="flex-1">{state.name}</span>
+            {state.id === story.workflowState.id ? (
+              <span aria-hidden="true" className="ml-3 text-muted-foreground">✓</span>
+            ) : null}
+          </DropdownMenuItem>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }
 
@@ -692,25 +735,55 @@ function StoryDetail({ id }: { id: number }) {
   const navigate = useBbNavigate();
   const { projectId } = useBbContext();
   const [story, setStory] = useState<Story | null>(null);
+  const [workflowStates, setWorkflowStates] = useState<ShortcutWorkflowState[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [starting, setStarting] = useState(false);
+  const [updatingState, setUpdatingState] = useState(false);
+  const requestGuardRef = useRef<StoryDetailRequestGuard | null>(null);
+  if (requestGuardRef.current === null) {
+    requestGuardRef.current = new StoryDetailRequestGuard(id);
+  }
+  const requestGuard = requestGuardRef.current;
+  requestGuard.activate(id);
+
+  const load = useCallback(async () => {
+    const request = requestGuard.begin(id);
+    setLoading(true);
+    try {
+      const { story: next, workflowStates: nextStates } = await rpc.call(
+        "getStory",
+        { id },
+      );
+      if (!requestGuard.isCurrent(request)) return;
+      setStory(next);
+      setWorkflowStates(nextStates);
+      setError(null);
+    } catch (cause) {
+      if (requestGuard.isCurrent(request)) {
+        setError(cause instanceof Error ? cause.message : String(cause));
+      }
+    } finally {
+      if (requestGuard.isCurrent(request)) {
+        setLoading(false);
+      }
+    }
+  }, [id, requestGuard, rpc]);
 
   useEffect(() => {
-    let cancelled = false;
-    setLoading(true);
-    void rpc.call("getStory", { id }).then(
-      ({ story: next }) => {
-        if (!cancelled) setStory(next);
-      },
-      (cause: unknown) => {
-        if (!cancelled) setError(cause instanceof Error ? cause.message : String(cause));
-      },
-    ).finally(() => {
-      if (!cancelled) setLoading(false);
-    });
-    return () => { cancelled = true; };
-  }, [id, rpc]);
+    requestGuard.invalidate();
+    setStory(null);
+    setWorkflowStates([]);
+    setError(null);
+    setStarting(false);
+    setUpdatingState(false);
+    void load();
+    return () => requestGuard.invalidate();
+  }, [load, requestGuard]);
+
+  useRealtime("stories-changed", () => {
+    void load();
+  });
 
   async function startWork() {
     setStarting(true);
@@ -724,6 +797,35 @@ function StoryDetail({ id }: { id: number }) {
     }
   }
 
+  async function updateWorkflowState(state: ShortcutWorkflowState) {
+    if (
+      !story ||
+      story.id !== id ||
+      updatingState ||
+      state.id === story.workflowState.id
+    ) return;
+    const storyId = story.id;
+    const activation = requestGuard.captureActivation();
+    setUpdatingState(true);
+    setError(null);
+    try {
+      const result = await requestWorkflowStateUpdate(rpc, story, state);
+      if (!requestGuard.isActive(activation)) return;
+      if (!result.ok) {
+        setError(result.error.message);
+        toast.error(`Could not update sc-${storyId}: ${result.error.message}`);
+        return;
+      }
+      const updatedStory = result.story;
+      setStory(updatedStory);
+      toast.success(`Moved sc-${storyId} to ${updatedStory.workflowState.name}`);
+    } finally {
+      if (requestGuard.isActive(activation)) setUpdatingState(false);
+    }
+  }
+
+  const visibleStory = story?.id === id ? story : null;
+
   return (
     <div className="h-full overflow-y-auto p-3 md:p-4">
       <div className="mx-auto w-full max-w-3xl space-y-4 text-sm">
@@ -731,25 +833,32 @@ function StoryDetail({ id }: { id: number }) {
           ← Assigned stories
         </Button>
         {error ? <ErrorNotice message={error} /> : null}
-        {loading ? <DetailSkeleton /> : null}
-        {story ? (
+        {(loading && !visibleStory) || (story !== null && visibleStory === null)
+          ? <DetailSkeleton />
+          : null}
+        {visibleStory ? (
           <article className="space-y-4">
             <header className="space-y-2.5 border-b border-border pb-4">
               <div className="flex flex-wrap items-center gap-2">
-                <span className="font-mono text-xs text-file-accent">sc-{story.id}</span>
-                <StateBadge story={story} />
-                <span className="text-xs capitalize text-muted-foreground">{story.storyType}</span>
-                {story.blocked ? <span className="text-xs font-medium text-destructive-text">Blocked</span> : null}
+                <span className="font-mono text-xs text-file-accent">sc-{visibleStory.id}</span>
+                <WorkflowStatePicker
+                  story={visibleStory}
+                  states={workflowStates}
+                  updating={updatingState}
+                  onChange={(state) => void updateWorkflowState(state)}
+                />
+                <span className="text-xs capitalize text-muted-foreground">{visibleStory.storyType}</span>
+                {visibleStory.blocked ? <span className="text-xs font-medium text-destructive-text">Blocked</span> : null}
               </div>
-              <h1 className="text-xl font-semibold tracking-tight text-foreground">{story.name}</h1>
+              <h1 className="text-xl font-semibold tracking-tight text-foreground">{visibleStory.name}</h1>
               <div className="flex flex-wrap gap-2">
                 <Button disabled={starting} onClick={() => void startWork()}>
                   {starting ? "Starting…" : "Start work in bb"}
                 </Button>
-                {story.appUrl ? (
+                {visibleStory.appUrl ? (
                   <Button asChild variant="outline">
                     <a
-                      href={story.appUrl}
+                      href={visibleStory.appUrl}
                       target="_blank"
                       rel="noreferrer"
                       data-shortcut-open-external=""
@@ -762,26 +871,26 @@ function StoryDetail({ id }: { id: number }) {
             </header>
 
             <dl className="grid grid-cols-2 gap-3 rounded-lg border border-border bg-card p-3 text-xs sm:grid-cols-4">
-              <div><dt className="text-subtle-foreground">Estimate</dt><dd className="mt-1 text-foreground">{story.estimate ?? "—"}</dd></div>
-              <div><dt className="text-subtle-foreground">Updated</dt><dd className="mt-1 text-foreground">{relativeTime(story.updatedAt)}</dd></div>
-              <div><dt className="text-subtle-foreground">Tasks</dt><dd className="mt-1 text-foreground">{story.tasks.filter((task) => task.complete).length}/{story.tasks.length}</dd></div>
-              <div><dt className="text-subtle-foreground">Deadline</dt><dd className="mt-1 text-foreground">{story.deadline ? new Date(story.deadline).toLocaleDateString() : "—"}</dd></div>
+              <div><dt className="text-subtle-foreground">Estimate</dt><dd className="mt-1 text-foreground">{visibleStory.estimate ?? "—"}</dd></div>
+              <div><dt className="text-subtle-foreground">Updated</dt><dd className="mt-1 text-foreground">{relativeTime(visibleStory.updatedAt)}</dd></div>
+              <div><dt className="text-subtle-foreground">Tasks</dt><dd className="mt-1 text-foreground">{visibleStory.tasks.filter((task) => task.complete).length}/{visibleStory.tasks.length}</dd></div>
+              <div><dt className="text-subtle-foreground">Deadline</dt><dd className="mt-1 text-foreground">{visibleStory.deadline ? new Date(visibleStory.deadline).toLocaleDateString() : "—"}</dd></div>
             </dl>
 
             <section className="space-y-2">
               <h2 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Description</h2>
-              {story.description ? (
-                <Markdown content={story.description} className="text-sm text-foreground" />
+              {visibleStory.description ? (
+                <Markdown content={visibleStory.description} className="text-sm text-foreground" />
               ) : (
                 <p className="text-xs text-muted-foreground">No description.</p>
               )}
             </section>
 
-            {story.tasks.length ? (
+            {visibleStory.tasks.length ? (
               <section className="space-y-2">
                 <h2 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Tasks</h2>
                 <ul className="divide-y divide-border rounded-lg border border-border bg-card">
-                  {story.tasks.map((task) => (
+                  {visibleStory.tasks.map((task) => (
                     <li key={task.id} className="flex gap-2 p-2.5 text-xs">
                       <span aria-hidden="true" className={task.complete ? "text-success" : "text-subtle-foreground"}>
                         {task.complete ? "✓" : "○"}
@@ -795,9 +904,9 @@ function StoryDetail({ id }: { id: number }) {
               </section>
             ) : null}
 
-            {story.labels.length ? (
+            {visibleStory.labels.length ? (
               <div className="flex flex-wrap gap-2">
-                {story.labels.map((label) => (
+                {visibleStory.labels.map((label) => (
                   <span key={label} className="rounded-full border border-border bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
                     {label}
                   </span>

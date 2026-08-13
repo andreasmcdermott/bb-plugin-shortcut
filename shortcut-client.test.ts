@@ -132,6 +132,105 @@ describe("ShortcutClient", () => {
     });
   });
 
+  it("lists a story's workflow states in workflow order", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/workflows")) {
+        return new Response(JSON.stringify([
+          { id: 7, name: "Product", states: [
+            { id: 12, name: "Done", type: "done", position: 3 },
+            { id: 10, name: "Ready", type: "unstarted", position: 1 },
+            { id: 11, name: "Building", type: "started", position: 2 },
+          ] },
+          { id: 8, name: "Support", states: [
+            { id: 20, name: "Queued", type: "unstarted", position: 1 },
+          ] },
+        ]));
+      }
+      if (url.endsWith("/stories/42")) {
+        return new Response(JSON.stringify({
+          id: 42,
+          name: "Ship the Shortcut plugin",
+          workflow_state_id: 11,
+        }));
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const detail = await new ShortcutClient("token").getStoryDetail(42);
+
+    expect(detail.story.workflowState.name).toBe("Building");
+    expect(detail.workflowStates.map((state) => state.name)).toEqual([
+      "Ready",
+      "Building",
+      "Done",
+    ]);
+  });
+
+  it("updates a story to a state in its own workflow", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/workflows")) {
+        return new Response(JSON.stringify([{ id: 7, name: "Product", states: [
+          { id: 10, name: "Ready", type: "unstarted", position: 1 },
+          { id: 11, name: "Building", type: "started", position: 2 },
+        ] }]));
+      }
+      if (url.endsWith("/stories/42") && init?.method === "PUT") {
+        expect(JSON.parse(String(init.body))).toEqual({ workflow_state_id: 11 });
+        return new Response(JSON.stringify({
+          id: 42,
+          name: "Ship the Shortcut plugin",
+          workflow_state_id: 11,
+        }));
+      }
+      if (url.endsWith("/stories/42")) {
+        return new Response(JSON.stringify({
+          id: 42,
+          name: "Ship the Shortcut plugin",
+          workflow_state_id: 10,
+        }));
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const story = await new ShortcutClient("token").updateStoryWorkflowState(42, 11);
+
+    expect(story.workflowState).toMatchObject({ id: 11, name: "Building" });
+  });
+
+  it("rejects a workflow state from another workflow", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      expect(init?.method).not.toBe("PUT");
+      if (url.endsWith("/workflows")) {
+        return new Response(JSON.stringify([
+          { id: 7, name: "Product", states: [
+            { id: 10, name: "Ready", type: "unstarted", position: 1 },
+          ] },
+          { id: 8, name: "Support", states: [
+            { id: 20, name: "Queued", type: "unstarted", position: 1 },
+          ] },
+        ]));
+      }
+      if (url.endsWith("/stories/42")) {
+        return new Response(JSON.stringify({
+          id: 42,
+          name: "Ship the Shortcut plugin",
+          workflow_state_id: 10,
+        }));
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      new ShortcutClient("token").updateStoryWorkflowState(42, 20),
+    ).rejects.toThrow("does not belong to the story's workflow");
+  });
+
   it("reorders a story relative to an adjacent story", async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       expect(String(input)).toBe("https://api.app.shortcut.com/api/v3/stories/42");

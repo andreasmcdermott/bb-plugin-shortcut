@@ -14656,6 +14656,24 @@ var ShortcutClient = class {
       }))
     };
   }
+  async storyWithWorkflowStates(id, signal) {
+    const [states, rawStory] = await Promise.all([
+      this.workflowStates(signal),
+      this.request(`/stories/${id}`, {}, signal)
+    ]);
+    return { states, story: this.normalizeStory(rawStory, states) };
+  }
+  async putStoryWorkflowState(id, targetState, states, signal) {
+    const updated = await this.request(
+      `/stories/${id}`,
+      {
+        method: "PUT",
+        body: JSON.stringify({ workflow_state_id: targetState.id })
+      },
+      signal
+    );
+    return this.normalizeStory(updated, states);
+  }
   async listAssignedStories(includeCompleted = false, signal) {
     const member = await this.currentMember(signal);
     const [states, stories] = await Promise.all([
@@ -14680,11 +14698,25 @@ var ShortcutClient = class {
     };
   }
   async getStory(id, signal) {
-    const [states, story] = await Promise.all([
-      this.workflowStates(signal),
-      this.request(`/stories/${id}`, {}, signal)
-    ]);
-    return this.normalizeStory(story, states);
+    return (await this.getStoryDetail(id, signal)).story;
+  }
+  async getStoryDetail(id, signal) {
+    const { states, story } = await this.storyWithWorkflowStates(id, signal);
+    return {
+      story,
+      workflowStates: [...states.values()].filter((state) => state.workflowId === story.workflowState.workflowId).sort((a, b) => a.position - b.position || a.name.localeCompare(b.name))
+    };
+  }
+  async updateStoryWorkflowState(id, workflowStateId, signal) {
+    const { states, story } = await this.storyWithWorkflowStates(id, signal);
+    const targetState = states.get(workflowStateId);
+    if (!targetState || targetState.workflowId !== story.workflowState.workflowId) {
+      throw new ShortcutApiError(
+        `Workflow state ${workflowStateId} does not belong to the story's workflow.`
+      );
+    }
+    if (targetState.id === story.workflowState.id) return story;
+    return this.putStoryWorkflowState(id, targetState, states, signal);
   }
   async reorderStory(id, adjacentId, placement, signal) {
     const updated = await this.request(
@@ -14704,11 +14736,7 @@ var ShortcutClient = class {
     return position;
   }
   async moveStoryToInDevelopment(id, signal) {
-    const [states, rawStory] = await Promise.all([
-      this.workflowStates(signal),
-      this.request(`/stories/${id}`, {}, signal)
-    ]);
-    const story = this.normalizeStory(rawStory, states);
+    const { states, story } = await this.storyWithWorkflowStates(id, signal);
     const normalizedTargetName = IN_DEVELOPMENT_STATE_NAME.toLowerCase();
     if (story.workflowState.name.trim().toLowerCase() === normalizedTargetName) {
       return story;
@@ -14721,15 +14749,7 @@ var ShortcutClient = class {
         `Shortcut workflow "${story.workflowState.workflowName}" has no "${IN_DEVELOPMENT_STATE_NAME}" state.`
       );
     }
-    const updated = await this.request(
-      `/stories/${id}`,
-      {
-        method: "PUT",
-        body: JSON.stringify({ workflow_state_id: targetState.id })
-      },
-      signal
-    );
-    return this.normalizeStory(updated, states);
+    return this.putStoryWorkflowState(id, targetState, states, signal);
   }
 };
 function storyAsMarkdown(story) {
@@ -14811,6 +14831,16 @@ var rpcContract = defineRpcContract({
   },
   getStory: {
     input: external_exports.object({ id: external_exports.number().int().positive() }).strict(),
+    output: external_exports.object({
+      story: storySchema,
+      workflowStates: external_exports.array(workflowStateSchema)
+    }).strict()
+  },
+  updateStoryWorkflowState: {
+    input: external_exports.object({
+      id: external_exports.number().int().positive(),
+      workflowStateId: external_exports.number().int().positive()
+    }).strict(),
     output: external_exports.object({ story: storySchema }).strict()
   },
   reorderStory: {
@@ -14942,7 +14972,16 @@ async function plugin(bb) {
       return { member: result.member, stories: filterStories(result.stories, query) };
     },
     async getStory({ id }) {
-      return { story: await story(id) };
+      return (await client()).getStoryDetail(id);
+    },
+    async updateStoryWorkflowState({ id, workflowStateId }) {
+      const updatedStory = await (await client()).updateStoryWorkflowState(
+        id,
+        workflowStateId
+      );
+      cached2 = null;
+      bb.realtime.publish("stories-changed", { reason: "workflow-state" });
+      return { story: updatedStory };
     },
     async reorderStory({ id, adjacentId, placement }) {
       if (id === adjacentId) {

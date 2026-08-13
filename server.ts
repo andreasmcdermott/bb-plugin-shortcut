@@ -67,6 +67,16 @@ export const rpcContract = defineRpcContract({
   },
   getStory: {
     input: z.object({ id: z.number().int().positive() }).strict(),
+    output: z.object({
+      story: storySchema,
+      workflowStates: z.array(workflowStateSchema),
+    }).strict(),
+  },
+  updateStoryWorkflowState: {
+    input: z.object({
+      id: z.number().int().positive(),
+      workflowStateId: z.number().int().positive(),
+    }).strict(),
     output: z.object({ story: storySchema }).strict(),
   },
   reorderStory: {
@@ -227,7 +237,16 @@ export default async function plugin(bb: BbPluginApi) {
       return { member: result.member, stories: filterStories(result.stories, query) };
     },
     async getStory({ id }) {
-      return { story: await story(id) };
+      return (await client()).getStoryDetail(id);
+    },
+    async updateStoryWorkflowState({ id, workflowStateId }) {
+      const updatedStory = await (await client()).updateStoryWorkflowState(
+        id,
+        workflowStateId,
+      );
+      cached = null;
+      bb.realtime.publish("stories-changed", { reason: "workflow-state" });
+      return { story: updatedStory };
     },
     async reorderStory({ id, adjacentId, placement }) {
       if (id === adjacentId) {
