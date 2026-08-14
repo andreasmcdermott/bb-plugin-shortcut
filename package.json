@@ -32,6 +32,7 @@
     "server.ts",
     "shortcut-client.ts",
     "shortcut-links.ts",
+    "story-detail-requests.ts",
     "README.md",
     "LICENSE"
   ],

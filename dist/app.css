@@ -257,6 +257,9 @@
     .ml-1 {
       margin-left: calc(var(--spacing) * 1);
     }
+    .ml-3 {
+      margin-left: calc(var(--spacing) * 3);
+    }
     .ml-auto {
       margin-left: auto;
     }
@@ -802,6 +805,9 @@
       font-size: var(--text-xs);
       line-height: var(--tw-leading, var(--text-xs--line-height));
     }
+    .text-\[9px\] {
+      font-size: 9px;
+    }
     .text-\[10px\] {
       font-size: 10px;
     }
@@ -1222,9 +1228,19 @@
         cursor: not-allowed;
       }
     }
+    .disabled\:cursor-wait {
+      &:disabled {
+        cursor: wait;
+      }
+    }
     .disabled\:opacity-50 {
       &:disabled {
         opacity: 50%;
+      }
+    }
+    .disabled\:opacity-60 {
+      &:disabled {
+        opacity: 60%;
       }
     }
     .aria-pressed\:bg-state-active {

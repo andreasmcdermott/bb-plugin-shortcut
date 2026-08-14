@@ -6041,6 +6041,55 @@ function shortcutStoryPluginPath(pluginId, storyId) {
   return `/plugins/${encodeURIComponent(pluginId)}/stories/${storyId}`;
 }
 
+// story-detail-requests.ts
+async function requestWorkflowStateUpdate(rpc, story, state) {
+  try {
+    const result = await rpc.call("updateStoryWorkflowState", {
+      id: story.id,
+      workflowStateId: state.id
+    });
+    return { ok: true, story: result.story };
+  } catch (cause) {
+    return {
+      ok: false,
+      error: cause instanceof Error ? cause : new Error(String(cause))
+    };
+  }
+}
+var StoryDetailRequestGuard = class {
+  activeStoryId;
+  activationGeneration = 0;
+  generation = 0;
+  constructor(storyId) {
+    this.activeStoryId = storyId;
+  }
+  activate(storyId) {
+    if (storyId === this.activeStoryId) return;
+    this.activeStoryId = storyId;
+    ++this.activationGeneration;
+    this.invalidate();
+  }
+  begin(storyId) {
+    this.activate(storyId);
+    return { storyId, generation: ++this.generation };
+  }
+  invalidate() {
+    ++this.generation;
+  }
+  isCurrent(request) {
+    return request.storyId === this.activeStoryId && request.generation === this.generation;
+  }
+  captureActivation() {
+    return {
+      storyId: this.activeStoryId,
+      generation: this.activationGeneration
+    };
+  }
+  isActive(activation) {
+    return activation.storyId === this.activeStoryId && activation.generation === this.activationGeneration;
+  }
+};
+
 // app.tsx
 function relativeTime(value) {
   if (!value) return "";
@@ -6098,8 +6147,40 @@ function KanbanSkeleton() {
     columnIndex
   )) });
 }
-function StateBadge({ story }) {
-  return /* @__PURE__ */ jsx("span", { className: "inline-flex items-center rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground", children: story.workflowState.name });
+function WorkflowStatePicker({
+  story,
+  states,
+  updating,
+  onChange
+}) {
+  return /* @__PURE__ */ jsxs(DropdownMenu2, { children: [
+    /* @__PURE__ */ jsx(DropdownMenuTrigger2, { asChild: true, children: /* @__PURE__ */ jsxs(
+      "button",
+      {
+        type: "button",
+        disabled: updating,
+        "aria-label": `Change workflow state. Current state: ${story.workflowState.name}`,
+        title: "Change workflow state",
+        className: "inline-flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-wait disabled:opacity-60",
+        children: [
+          /* @__PURE__ */ jsx("span", { children: updating ? "Updating\u2026" : story.workflowState.name }),
+          /* @__PURE__ */ jsx("span", { "aria-hidden": "true", className: "text-[9px]", children: "\u25BE" })
+        ]
+      }
+    ) }),
+    /* @__PURE__ */ jsx(DropdownMenuContent2, { align: "start", mobileTitle: "Change workflow state", children: states.map((state) => /* @__PURE__ */ jsxs(
+      DropdownMenuItem2,
+      {
+        disabled: updating || state.id === story.workflowState.id,
+        onSelect: () => onChange(state),
+        children: [
+          /* @__PURE__ */ jsx("span", { className: "flex-1", children: state.name }),
+          state.id === story.workflowState.id ? /* @__PURE__ */ jsx("span", { "aria-hidden": "true", className: "ml-3 text-muted-foreground", children: "\u2713" }) : null
+        ]
+      },
+      state.id
+    )) })
+  ] });
 }
 function StoryCard({
   story,
@@ -6588,26 +6669,52 @@ function StoryDetail({ id }) {
   const navigate = useBbNavigate();
   const { projectId } = useBbContext();
   const [story, setStory] = useState(null);
+  const [workflowStates, setWorkflowStates] = useState([]);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(true);
   const [starting, setStarting] = useState(false);
-  useEffect(() => {
-    let cancelled = false;
+  const [updatingState, setUpdatingState] = useState(false);
+  const requestGuardRef = useRef(null);
+  if (requestGuardRef.current === null) {
+    requestGuardRef.current = new StoryDetailRequestGuard(id);
+  }
+  const requestGuard = requestGuardRef.current;
+  requestGuard.activate(id);
+  const load = useCallback(async () => {
+    const request = requestGuard.begin(id);
     setLoading(true);
-    void rpc.call("getStory", { id }).then(
-      ({ story: next }) => {
-        if (!cancelled) setStory(next);
-      },
-      (cause) => {
-        if (!cancelled) setError(cause instanceof Error ? cause.message : String(cause));
+    try {
+      const { story: next, workflowStates: nextStates } = await rpc.call(
+        "getStory",
+        { id }
+      );
+      if (!requestGuard.isCurrent(request)) return;
+      setStory(next);
+      setWorkflowStates(nextStates);
+      setError(null);
+    } catch (cause) {
+      if (requestGuard.isCurrent(request)) {
+        setError(cause instanceof Error ? cause.message : String(cause));
       }
-    ).finally(() => {
-      if (!cancelled) setLoading(false);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [id, rpc]);
+    } finally {
+      if (requestGuard.isCurrent(request)) {
+        setLoading(false);
+      }
+    }
+  }, [id, requestGuard, rpc]);
+  useEffect(() => {
+    requestGuard.invalidate();
+    setStory(null);
+    setWorkflowStates([]);
+    setError(null);
+    setStarting(false);
+    setUpdatingState(false);
+    void load();
+    return () => requestGuard.invalidate();
+  }, [load, requestGuard]);
+  useRealtime("stories-changed", () => {
+    void load();
+  });
   async function startWork() {
     setStarting(true);
     setError(null);
@@ -6619,28 +6726,58 @@ function StoryDetail({ id }) {
       setStarting(false);
     }
   }
+  async function updateWorkflowState(state) {
+    if (!story || story.id !== id || updatingState || state.id === story.workflowState.id) return;
+    const storyId = story.id;
+    const activation = requestGuard.captureActivation();
+    setUpdatingState(true);
+    setError(null);
+    try {
+      const result = await requestWorkflowStateUpdate(rpc, story, state);
+      if (!requestGuard.isActive(activation)) return;
+      if (!result.ok) {
+        setError(result.error.message);
+        toast.error(`Could not update sc-${storyId}: ${result.error.message}`);
+        return;
+      }
+      const updatedStory = result.story;
+      setStory(updatedStory);
+      toast.success(`Moved sc-${storyId} to ${updatedStory.workflowState.name}`);
+    } finally {
+      if (requestGuard.isActive(activation)) setUpdatingState(false);
+    }
+  }
+  const visibleStory = story?.id === id ? story : null;
   return /* @__PURE__ */ jsx("div", { className: "h-full overflow-y-auto p-3 md:p-4", children: /* @__PURE__ */ jsxs("div", { className: "mx-auto w-full max-w-3xl space-y-4 text-sm", children: [
     /* @__PURE__ */ jsx(Button, { variant: "ghost", size: "sm", onClick: () => navigate.toPluginPanel("stories"), children: "\u2190 Assigned stories" }),
     error ? /* @__PURE__ */ jsx(ErrorNotice, { message: error }) : null,
-    loading ? /* @__PURE__ */ jsx(DetailSkeleton, {}) : null,
-    story ? /* @__PURE__ */ jsxs("article", { className: "space-y-4", children: [
+    loading && !visibleStory || story !== null && visibleStory === null ? /* @__PURE__ */ jsx(DetailSkeleton, {}) : null,
+    visibleStory ? /* @__PURE__ */ jsxs("article", { className: "space-y-4", children: [
       /* @__PURE__ */ jsxs("header", { className: "space-y-2.5 border-b border-border pb-4", children: [
         /* @__PURE__ */ jsxs("div", { className: "flex flex-wrap items-center gap-2", children: [
           /* @__PURE__ */ jsxs("span", { className: "font-mono text-xs text-file-accent", children: [
             "sc-",
-            story.id
+            visibleStory.id
           ] }),
-          /* @__PURE__ */ jsx(StateBadge, { story }),
-          /* @__PURE__ */ jsx("span", { className: "text-xs capitalize text-muted-foreground", children: story.storyType }),
-          story.blocked ? /* @__PURE__ */ jsx("span", { className: "text-xs font-medium text-destructive-text", children: "Blocked" }) : null
+          /* @__PURE__ */ jsx(
+            WorkflowStatePicker,
+            {
+              story: visibleStory,
+              states: workflowStates,
+              updating: updatingState,
+              onChange: (state) => void updateWorkflowState(state)
+            }
+          ),
+          /* @__PURE__ */ jsx("span", { className: "text-xs capitalize text-muted-foreground", children: visibleStory.storyType }),
+          visibleStory.blocked ? /* @__PURE__ */ jsx("span", { className: "text-xs font-medium text-destructive-text", children: "Blocked" }) : null
         ] }),
-        /* @__PURE__ */ jsx("h1", { className: "text-xl font-semibold tracking-tight text-foreground", children: story.name }),
+        /* @__PURE__ */ jsx("h1", { className: "text-xl font-semibold tracking-tight text-foreground", children: visibleStory.name }),
         /* @__PURE__ */ jsxs("div", { className: "flex flex-wrap gap-2", children: [
           /* @__PURE__ */ jsx(Button, { disabled: starting, onClick: () => void startWork(), children: starting ? "Starting\u2026" : "Start work in bb" }),
-          story.appUrl ? /* @__PURE__ */ jsx(Button, { asChild: true, variant: "outline", children: /* @__PURE__ */ jsx(
+          visibleStory.appUrl ? /* @__PURE__ */ jsx(Button, { asChild: true, variant: "outline", children: /* @__PURE__ */ jsx(
             "a",
             {
-              href: story.appUrl,
+              href: visibleStory.appUrl,
               target: "_blank",
               rel: "noreferrer",
               "data-shortcut-open-external": "",
@@ -6652,37 +6789,37 @@ function StoryDetail({ id }) {
       /* @__PURE__ */ jsxs("dl", { className: "grid grid-cols-2 gap-3 rounded-lg border border-border bg-card p-3 text-xs sm:grid-cols-4", children: [
         /* @__PURE__ */ jsxs("div", { children: [
           /* @__PURE__ */ jsx("dt", { className: "text-subtle-foreground", children: "Estimate" }),
-          /* @__PURE__ */ jsx("dd", { className: "mt-1 text-foreground", children: story.estimate ?? "\u2014" })
+          /* @__PURE__ */ jsx("dd", { className: "mt-1 text-foreground", children: visibleStory.estimate ?? "\u2014" })
         ] }),
         /* @__PURE__ */ jsxs("div", { children: [
           /* @__PURE__ */ jsx("dt", { className: "text-subtle-foreground", children: "Updated" }),
-          /* @__PURE__ */ jsx("dd", { className: "mt-1 text-foreground", children: relativeTime(story.updatedAt) })
+          /* @__PURE__ */ jsx("dd", { className: "mt-1 text-foreground", children: relativeTime(visibleStory.updatedAt) })
         ] }),
         /* @__PURE__ */ jsxs("div", { children: [
           /* @__PURE__ */ jsx("dt", { className: "text-subtle-foreground", children: "Tasks" }),
           /* @__PURE__ */ jsxs("dd", { className: "mt-1 text-foreground", children: [
-            story.tasks.filter((task) => task.complete).length,
+            visibleStory.tasks.filter((task) => task.complete).length,
             "/",
-            story.tasks.length
+            visibleStory.tasks.length
           ] })
         ] }),
         /* @__PURE__ */ jsxs("div", { children: [
           /* @__PURE__ */ jsx("dt", { className: "text-subtle-foreground", children: "Deadline" }),
-          /* @__PURE__ */ jsx("dd", { className: "mt-1 text-foreground", children: story.deadline ? new Date(story.deadline).toLocaleDateString() : "\u2014" })
+          /* @__PURE__ */ jsx("dd", { className: "mt-1 text-foreground", children: visibleStory.deadline ? new Date(visibleStory.deadline).toLocaleDateString() : "\u2014" })
         ] })
       ] }),
       /* @__PURE__ */ jsxs("section", { className: "space-y-2", children: [
         /* @__PURE__ */ jsx("h2", { className: "text-xs font-semibold uppercase tracking-wide text-muted-foreground", children: "Description" }),
-        story.description ? /* @__PURE__ */ jsx(Markdown, { content: story.description, className: "text-sm text-foreground" }) : /* @__PURE__ */ jsx("p", { className: "text-xs text-muted-foreground", children: "No description." })
+        visibleStory.description ? /* @__PURE__ */ jsx(Markdown, { content: visibleStory.description, className: "text-sm text-foreground" }) : /* @__PURE__ */ jsx("p", { className: "text-xs text-muted-foreground", children: "No description." })
       ] }),
-      story.tasks.length ? /* @__PURE__ */ jsxs("section", { className: "space-y-2", children: [
+      visibleStory.tasks.length ? /* @__PURE__ */ jsxs("section", { className: "space-y-2", children: [
         /* @__PURE__ */ jsx("h2", { className: "text-xs font-semibold uppercase tracking-wide text-muted-foreground", children: "Tasks" }),
-        /* @__PURE__ */ jsx("ul", { className: "divide-y divide-border rounded-lg border border-border bg-card", children: story.tasks.map((task) => /* @__PURE__ */ jsxs("li", { className: "flex gap-2 p-2.5 text-xs", children: [
+        /* @__PURE__ */ jsx("ul", { className: "divide-y divide-border rounded-lg border border-border bg-card", children: visibleStory.tasks.map((task) => /* @__PURE__ */ jsxs("li", { className: "flex gap-2 p-2.5 text-xs", children: [
           /* @__PURE__ */ jsx("span", { "aria-hidden": "true", className: task.complete ? "text-success" : "text-subtle-foreground", children: task.complete ? "\u2713" : "\u25CB" }),
           /* @__PURE__ */ jsx("span", { className: task.complete ? "text-muted-foreground line-through" : "text-foreground", children: task.description })
         ] }, task.id)) })
       ] }) : null,
-      story.labels.length ? /* @__PURE__ */ jsx("div", { className: "flex flex-wrap gap-2", children: story.labels.map((label) => /* @__PURE__ */ jsx("span", { className: "rounded-full border border-border bg-muted px-2 py-0.5 text-[11px] text-muted-foreground", children: label }, label)) }) : null
+      visibleStory.labels.length ? /* @__PURE__ */ jsx("div", { className: "flex flex-wrap gap-2", children: visibleStory.labels.map((label) => /* @__PURE__ */ jsx("span", { className: "rounded-full border border-border bg-muted px-2 py-0.5 text-[11px] text-muted-foreground", children: label }, label)) }) : null
     ] }) : null
   ] }) });
 }
