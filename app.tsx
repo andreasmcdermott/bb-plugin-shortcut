@@ -745,7 +745,6 @@ function StoryDetail({ id }: { id: number }) {
     requestGuardRef.current = new StoryDetailRequestGuard(id);
   }
   const requestGuard = requestGuardRef.current;
-  requestGuard.activate(id);
 
   const load = useCallback(async () => {
     const request = requestGuard.begin(id);
